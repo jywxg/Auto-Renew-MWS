@@ -48,6 +48,20 @@ def build_proxies():
         return {"http": PROXY_SERVER, "https": PROXY_SERVER}
     return None
 
+def get_egress_ip():
+    """出口 IP 预检：确认当前网络路径真正能出网，失败返回空字符串"""
+    try:
+        resp = requests.get(
+            "https://api.ipify.org",
+            timeout=15,
+            proxies=build_proxies(),
+        )
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
+    return ""
+
 def send_tg_notification(message: str):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -349,6 +363,18 @@ def main():
 
     print(f"🚀 开始续期任务，共 {len(server_list)} 个服务器: {server_list}")
     print(f"🔗 使用代理: {PROXY_SERVER}" if IS_PROXY else "🍭 未使用代理，直连访问")
+
+    egress_ip = get_egress_ip()
+    if egress_ip:
+        print(f"📍 当前出口IP: {egress_ip}")
+    else:
+        print("❌ 出口IP检测失败，当前网络无法出网，终止任务")
+        send_tg_notification(
+            "🇯🇵 MWS 续期通知\n\n"
+            f"❌ 续期失败\n👤 账户: {EMAIL}\n"
+            "⚠️ 出口IP检测失败，代理无法出网或网络异常，请检查 NODE_LINK。"
+        )
+        return
 
     if COOKIE:
         expiry = get_expiry_from_cookie(COOKIE)
