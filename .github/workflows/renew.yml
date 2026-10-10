@@ -27,12 +27,12 @@ jobs:
           sudo apt-get install -y jq wget
           pip install curl_cffi
 
-      - name: ⚙ 设置代理 (sing-box)
+      - name: ⚙ 设置代理 (sing-box，多节点轮询)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          bash ./setup_proxy.sh
 
       - name: 🧪 测试代理到目标站点的连通性
         if: env.IS_PROXY == 'true'
@@ -79,7 +79,7 @@ jobs:
         if: always()
         run: |
           pkill -f sing-box || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          rm -f sing-box sing-box-config.json sing-box.log sing-box-check.log proxy.env
 
       # 更新时间到time.txt,避免6个月未更新导致工作流暂停
       - name: 🕒 提交运行时间
