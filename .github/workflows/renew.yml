@@ -34,6 +34,17 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
+      - name: 🧪 测试代理到目标站点的连通性
+        if: env.IS_PROXY == 'true'
+        continue-on-error: true
+        run: |
+          echo "=== 经代理测试 cloud.m-ws.cc (续期 API) ==="
+          curl -x socks5h://127.0.0.1:1080 -m 15 -s -o /dev/null -w "HTTP %{http_code} (耗时 %{time_total}s)\n" https://cloud.m-ws.cc || echo "❌ cloud.m-ws.cc 经代理不可达"
+          echo "=== 经代理测试 cloud-api.m-ws.cc (Discord OAuth 入口) ==="
+          curl -x socks5h://127.0.0.1:1080 -m 15 -s -o /dev/null -w "HTTP %{http_code} (耗时 %{time_total}s)\n" https://cloud-api.m-ws.cc/auth/login || echo "❌ cloud-api.m-ws.cc 经代理不可达"
+          echo "=== 经代理测试 api.telegram.org (TG 通知) ==="
+          curl -x socks5h://127.0.0.1:1080 -m 15 -s -o /dev/null -w "HTTP %{http_code} (耗时 %{time_total}s)\n" https://api.telegram.org || echo "❌ api.telegram.org 经代理不可达"
+
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
