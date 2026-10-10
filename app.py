@@ -346,7 +346,7 @@ def fetch_new_cookie_via_http() -> str:
 
 # ================= 主流程 =================
 def main():
-    global COOKIE
+    global COOKIE, IS_PROXY
 
     print("#" * 25)
     print("   MWS 自动续期")
@@ -365,14 +365,19 @@ def main():
     print(f"🔗 使用代理: {PROXY_SERVER}" if IS_PROXY else "🍭 未使用代理，直连访问")
 
     egress_ip = get_egress_ip()
+    if not egress_ip and IS_PROXY:
+        # 代理实战不通时自动降级为直连，而不是直接终止
+        print("⚠️ 代理无法出网，自动切换为直连模式重试...")
+        IS_PROXY = False
+        egress_ip = get_egress_ip()
     if egress_ip:
-        print(f"📍 当前出口IP: {egress_ip}")
+        print(f"📍 当前出口IP: {egress_ip}" + ("" if IS_PROXY else " (直连)"))
     else:
-        print("❌ 出口IP检测失败，当前网络无法出网，终止任务")
+        print("❌ 出口IP检测失败，代理和直连均无法出网，终止任务")
         send_tg_notification(
             "🇯🇵 MWS 续期通知\n\n"
             f"❌ 续期失败\n👤 账户: {EMAIL}\n"
-            "⚠️ 出口IP检测失败，代理无法出网或网络异常，请检查 NODE_LINK。"
+            "⚠️ 出口IP检测失败，代理和直连均无法出网，请检查网络或 NODE_LINK。"
         )
         return
 
