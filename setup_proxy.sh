@@ -11,6 +11,14 @@
 #  [中]   userinfo(密码/auth) 做 %xx 解码 (tuic/socks/hysteria2/trojan/anytls)
 #  [优化] sing-box check 先验配置; curl 超时+重试; GitHub API 支持 GH_TOKEN; 导出 PROXY_HTTP_SERVER
 #  [新增] ss:// (Shadowsocks): SIP002 / 老式整体base64 / 明文兼容，支持 plugin 参数
+# 修复记录 (2026-10-11):
+#  [高]   tuic alpn JSON 注入：awk 拼接加字符白名单（全脚本唯一未走 json_esc 的用户输入）
+#  [中]   连通性测试改用 _curl_test（--retry 0 快速失败，挂起节点不再拖 ~60s）
+#  [中]   vless/vmess 无 security 参数且端口 443 时默认启用 TLS（防可用节点被误判跳过）
+#  [低]   sing-box 启动后轮询 1080 端口代替固定 sleep 2（快机器不等、慢机器不误杀）
+#  [低]   包管理器安装失败加明确报错（原来 set -e 下静默退出）
+# 修复记录 (2026-10-11 合并版):
+#  [合]   取双方实现之长：apt/apk/yum 分步报错走 stderr；exec 3<> 探活只建连不发数据
 export LC_ALL=C
 set -e
 
@@ -38,6 +46,8 @@ trap proxy_env_hint EXIT
 
 # 统一 curl：超时 + 重试，避免长时间挂起
 _curl() { curl -sL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 3 "$@"; }
+# 节点连通性测试专用：快速失败，不重试（挂起的节点不值得等待重试）
+_curl_test() { curl -sL --connect-timeout 8 --max-time 8 --retry 0 "$@"; }
 
 if [ -z "$NODE_LINK" ]; then
   echo "[INFO] 未配置代理，直连模式"
@@ -59,11 +69,24 @@ for pkg in jq curl base64; do
     [ "$pkg" = "base64" ] && realpkg="coreutils"
     echo "[WARN] $pkg 未安装，正在尝试安装 $realpkg ..."
     if command -v apt-get >/dev/null 2>&1; then
-      $_SUDO apt-get update -q && $_SUDO apt-get install -y "$realpkg"
+      if ! $_SUDO apt-get update -q; then
+        echo "[ERROR] apt-get update 失败，请检查网络或更换镜像源" >&2
+        exit 1
+      fi
+      if ! $_SUDO apt-get install -y "$realpkg"; then
+        echo "[ERROR] apt-get install $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
     elif command -v apk >/dev/null 2>&1; then
-      $_SUDO apk add "$realpkg"
+      if ! $_SUDO apk add "$realpkg"; then
+        echo "[ERROR] apk add $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
     elif command -v yum >/dev/null 2>&1; then
-      $_SUDO yum install -y "$realpkg"
+      if ! $_SUDO yum install -y "$realpkg"; then
+        echo "[ERROR] yum install $realpkg 失败，请手动安装后重试。" >&2
+        exit 1
+      fi
     else
       echo "[ERROR] 找不到支持的包管理器安装 $realpkg，请手动安装后重试。"
       exit 1
@@ -563,6 +586,12 @@ for single_node in "${NODE_ARRAY[@]}"; do
         fi
       fi
       tls_enabled="false"; if [ "$outbound_security" = "tls" ] || [ "$outbound_security" = "reality" ]; then tls_enabled="true"; fi
+      # 启发式：security 未指定但端口为 443 时默认开启 TLS（部分订阅省略 security 参数，
+      # 否则 443 上的 TLS 节点会被误判"无法连接"跳过，且日志看不出真实原因）
+      if [ "$tls_enabled" = "false" ] && [ -z "$outbound_security" ] && [ "$outbound_port" = "443" ]; then
+        tls_enabled="true"
+        echo "[INFO] 节点 [$node_idx] 端口 443 未指定 security，默认启用 TLS"
+      fi
       tls_json="{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}"
       if [ "$outbound_security" = "reality" ]; then tls_json="$tls_json,\"reality\":{\"enabled\":true,\"public_key\":\"$J_PBK\",\"short_id\":\"$J_SID\"}"; fi
       tls_json="$tls_json}"
@@ -578,6 +607,11 @@ for single_node in "${NODE_ARRAY[@]}"; do
         fi
       fi
       tls_enabled="false"; if [ "$outbound_security" = "tls" ]; then tls_enabled="true"; fi
+      # 启发式：tls 字段缺失但端口为 443 时默认开启 TLS（同 vless）
+      if [ "$tls_enabled" = "false" ] && [ -z "$outbound_security" ] && [ "$outbound_port" = "443" ]; then
+        tls_enabled="true"
+        echo "[INFO] 节点 [$node_idx] 端口 443 未指定 tls，默认启用 TLS"
+      fi
       jq_outbound="$jq_outbound,\"tls\":{\"enabled\":$tls_enabled,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$J_FP\"}}"
       ;;
     trojan)
@@ -609,9 +643,9 @@ for single_node in "${NODE_ARRAY[@]}"; do
       jq_outbound="$jq_outbound,\"zero_rtt_handshake\":$outbound_zerortt"
       tls_json="{\"enabled\":true,\"server_name\":\"$J_SNI\",\"insecure\":$outbound_insecure"
       if [ -n "$outbound_alpn" ]; then
-        # alpn=a,b 需要生成 JSON 数组，而不是一个包含逗号的字符串
-        alpn_json="$(printf '%s' "$outbound_alpn" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i); if($i!=""){if(n++) printf ","; printf "\"%s\"", $i}}}')"
-        tls_json="$tls_json,\"alpn\":[$alpn_json]"
+        # alpn=a,b 需要生成 JSON 数组；字符白名单防 JSON 注入（合法值仅字母数字 . / _ -）
+        alpn_json="$(printf '%s' "$outbound_alpn" | awk -F',' '{for(i=1;i<=NF;i++){gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i); if($i ~ /^[A-Za-z0-9.\/_-]+$/){if(n++) printf ","; printf "\"%s\"", $i}}}')"
+        if [ -n "$alpn_json" ]; then tls_json="$tls_json,\"alpn\":[$alpn_json]"; fi
       fi
       tls_json="$tls_json}"
       jq_outbound="$jq_outbound,\"tls\":$tls_json"
@@ -659,7 +693,14 @@ EOF
 
   ./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
   CURRENT_SB_PID=$!
-  sleep 2
+
+  # 轮询等待 socks 入站就绪（最多 5 秒）：快机器不等、慢机器不误杀，代替固定 sleep 2；
+  # exec 3<> 只建连不发数据（比 echo 探活更干净），子 shell 包裹以压住 refused 报错，进程崩溃时提前跳出
+  for _i in $(seq 1 10); do
+    if ! kill -0 "$CURRENT_SB_PID" 2>/dev/null; then break; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then break; fi
+    sleep 0.5
+  done
 
   if ! kill -0 "$CURRENT_SB_PID" 2>/dev/null; then
     echo "[WARN] ❌ sing-box 启动失败 (配置参数校验不通过)，立即切换下一个..."
@@ -669,11 +710,12 @@ EOF
   fi
 
   echo "[INFO] 测试节点连接性..."
-  # 用 socks5h：DNS 解析走代理，避免本地 DNS 污染导致误判节点失效
-  ip_info=$(_curl -x socks5h://127.0.0.1:1080 --max-time 8 https://ipinfo.io/json || true)
+  # 用 socks5h：DNS 解析走代理，避免本地 DNS 污染导致误判节点失效；
+  # 测试专用 _curl_test 不重试，挂起节点快速失败、立即换下一个
+  ip_info=$(_curl_test -x socks5h://127.0.0.1:1080 https://ipinfo.io/json || true)
   # ipinfo 偶发限流：备用端点
   if [ -z "$ip_info" ]; then
-    ip_info=$(_curl -x socks5h://127.0.0.1:1080 --max-time 8 "https://api.ipify.org?format=json" || true)
+    ip_info=$(_curl_test -x socks5h://127.0.0.1:1080 "https://api.ipify.org?format=json" || true)
   fi
 
   if [ -n "$ip_info" ] && echo "$ip_info" | jq -e '.ip' > /dev/null 2>&1; then
