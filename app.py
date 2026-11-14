@@ -219,6 +219,12 @@ def _parse_remaining_hours(text):
     m = re.search(r"SLEEP IN\s*(\d+)\s*h", text, re.I)
     if m:
         return int(m.group(1))
+    m = re.search(r"(\d+)\s*d\s*(\d+)\s*h", text)
+    if m:
+        return int(m.group(1)) * 24 + int(m.group(2))
+    m = re.search(r"(\d+)\s*h\s*left", text, re.I)
+    if m:
+        return int(m.group(1))
     m = re.search(r"剩余\s*(\d+)\s*h", text)
     if m:
         return int(m.group(1))
@@ -243,7 +249,7 @@ def _renew_button_exists(page):
     var btns = document.querySelectorAll('button, a');
     for (var i = 0; i < btns.length; i++) {
         var t = (btns[i].innerText || '').trim();
-        if (/重置计时器|续期|延長/.test(t) && btns[i].offsetParent !== null) return true;
+        if (/重置计时器|续期|延長|リセット|Reset timer|Extend|Renew/i.test(t) && btns[i].offsetParent !== null) return true;
     }
     return false;
     """
@@ -351,7 +357,7 @@ def _click_renew_button(page):
     var btns = document.querySelectorAll('button, a');
     for (var i = 0; i < btns.length; i++) {
         var t = (btns[i].innerText || '').trim();
-        if (/重置计时器|续期|延長/.test(t) && btns[i].offsetParent !== null) {
+        if (/重置计时器|续期|延長|リセット|Reset timer|Extend|Renew/i.test(t) && btns[i].offsetParent !== null) {
             btns[i].scrollIntoView();
             btns[i].click();
             return t;
@@ -371,7 +377,7 @@ def _wait_renew_outcome(page, baseline_hours, timeout=30):
     last = baseline_hours
     while time.time() < deadline:
         text = _page_text(page)
-        if any(k in text for k in ("確認に失敗しました", "验证失败", "驗證失敗")):
+        if any(k in text for k in ("確認に失敗しました", "验证失败", "驗證失敗", "Verification failed")):
             return False, last
         cur = _parse_remaining_hours(text)
         if cur is not None:
