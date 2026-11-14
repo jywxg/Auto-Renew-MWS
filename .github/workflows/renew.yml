@@ -9,6 +9,7 @@ on:
 jobs:
   Renew-mws:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       actions: write
       contents: write
@@ -24,8 +25,13 @@ jobs:
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget
-          pip install curl_cffi
+          sudo apt-get install -y jq wget xvfb fonts-ipafont-gothic libnss3 libgbm1 libasound2t64 libxss1 libgtk-3-0
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          fi
+          google-chrome --version
+          pip install curl_cffi "DrissionPage>=4.1.1.2"
 
       - name: ⚙ 设置代理 (sing-box)
         continue-on-error: true
@@ -44,8 +50,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
+          BROWSER_PATH: /usr/bin/google-chrome
         run: |
-          python3 app.py
+          xvfb-run -a -s "-screen 0 1920x1080x24" python3 app.py
 
       - name: 🧽 清理进程和临时文件
         if: always()
