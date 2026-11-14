@@ -169,11 +169,14 @@ def renew_server(server_id: str):
 TURNSTILE_TOKEN_POLL_SECONDS = int(os.environ.get("TURNSTILE_TOKEN_POLL_SECONDS", "30"))
 
 def _browser_proxy():
-    """Chromium 用的代理地址，与 build_proxies 同源；Chromium 的 socks5 自带远端解析，不用 socks5h 写法"""
+    """Chromium 用的代理地址，与 build_proxies 同源。
+    DrissionPage 不支持 socks 代理设置；sing-box 本地监听是 mixed 口，
+    同一端口可走 HTTP 代理，Chromium 改用 http:// 方案（端口不变）"""
     if not IS_PROXY:
         return ""
-    if PROXY_SERVER.startswith("socks5h://"):
-        return "socks5://" + PROXY_SERVER[len("socks5h://"):]
+    for prefix in ("socks5h://", "socks5://"):
+        if PROXY_SERVER.startswith(prefix):
+            return "http://" + PROXY_SERVER[len(prefix):]
     return PROXY_SERVER
 
 def _build_browser_options():
@@ -221,6 +224,44 @@ def _parse_remaining_hours(text):
         return int(m.group(1))
     return None
 
+def _log_page_diag(page, tag):
+    """失败时把浏览器实际看到的页面打进日志：地址、标题、正文前 200 字"""
+    try:
+        title = page.title or ""
+    except Exception:
+        title = ""
+    text = _page_text(page).replace("\n", " ")[:200]
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+    print(f"🔎 [{tag}] url={url} title={title} text={text}")
+
+def _renew_button_exists(page):
+    """详情页是否已渲染出续期按钮（不点击）"""
+    js = r"""
+    var btns = document.querySelectorAll('button, a');
+    for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].innerText || '').trim();
+        if (/重置计时器|续期|延長/.test(t) && btns[i].offsetParent !== null) return true;
+    }
+    return false;
+    """
+    try:
+        return bool(page.run_js(js))
+    except Exception:
+        return False
+
+def _wait_detail_ready(page, timeout=15):
+    """等详情页渲染：读到剩余时间或出现续期按钮为止。返回 (剩余小时数, 是否就绪)"""
+    deadline = time.time() + timeout
+    baseline = None
+    while time.time() < deadline:
+        baseline = _parse_remaining_hours(_page_text(page))
+        if baseline is not None or _renew_button_exists(page):
+            return baseline, True
+        time.sleep(1)
+    return baseline, _renew_button_exists(page)
 def _find_turnstile_rect(page):
     """找到 Turnstile 可点击区域，返回视口坐标 [x, y, w, h]；找不到返回 None。
     优先 iframe（checkbox 实际所在），其次 .cf-turnstile 容器，最后带 data-sitekey 的元素。
@@ -360,24 +401,32 @@ def renew_server_browser(server_id: str):
             "domain": "cloud.m-ws.cc", "path": "/", "secure": True,
         })
         page.get(f"{SITE_ORIGIN}/bots/{server_id}")
-        time.sleep(3)
+        baseline, _ = _wait_detail_ready(page, timeout=15)
         text = _page_text(page)
-        baseline = _parse_remaining_hours(text)
-        if "/login" in page.url or baseline is None and "ログイン" in text:
+        if "/login" in page.url or (
+            baseline is None
+            and any(k in text for k in ("ログイン", "登录", "Log in"))
+        ):
+            _log_page_diag(page, server_id)
             print(f"❌ [{server_id}] 浏览器里未登录（COOKIE 可能已失效）")
             return False, None, "auth"
-        if baseline is not None:
+        if baseline is None:
+            _log_page_diag(page, server_id)
+            print(f"⚠️ [{server_id}] 未读到剩余时间，仍尝试续期流程")
+        else:
             print(f"🖥 [{server_id}] 浏览器续期：当前剩余 {baseline} 小时")
         # 预刷新一次再验证（XServer 现行策略：先刷新一遍，坏抽签概率低）
         page.refresh()
-        time.sleep(3)
-        baseline = _parse_remaining_hours(_page_text(page)) or baseline
+        baseline2, _ = _wait_detail_ready(page, timeout=15)
+        if baseline2 is not None:
+            baseline = baseline2
         for round_no in range(2):
             if round_no == 1:
                 print("🔄 第一轮未成功，刷新页面再试一轮...")
                 page.refresh()
-                time.sleep(3)
+                _wait_detail_ready(page, timeout=15)
             if not _click_renew_button(page):
+                _log_page_diag(page, server_id)
                 print(f"❌ [{server_id}] 没找到续期按钮")
                 return False, None, ""
             time.sleep(2)  # 等验证弹窗
@@ -392,6 +441,10 @@ def renew_server_browser(server_id: str):
         return False, None, "captcha"
     except Exception as e:
         print(f"❌ [{server_id}] 浏览器续期异常: {e}")
+        try:
+            _log_page_diag(page, server_id)
+        except Exception:
+            pass
         return False, None, ""
     finally:
         if page is not None:
@@ -399,6 +452,7 @@ def renew_server_browser(server_id: str):
                 page.quit()
             except Exception:
                 pass
+
 # ================= Discord OAuth 登录（API 请求失败时的兜底，纯 HTTP） =================
 #   1) GET /auth/login 拿授权 URL（含 state），Session 自动种下 oauth_state cookie
 #   2) DISCORD_TOKEN 调 Discord OAuth2 API 授权，拿回带 code 的回调 location
