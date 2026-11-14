@@ -472,26 +472,32 @@ def _turnstile_diag(page):
         print(f"🔎 Turnstile 现场读取失败: {e}")
 
 def _panel_dump(page):
-    """把「確認しています…」面板的 DOM 结构打进日志：它挂在哪、里面有什么、
-    有没有 shadow DOM 宿主、turnstile.render 是否可用——定位组件到底渲染没渲染"""
+    """把验证面板的真实结构打进日志：最小宿主元素的 HTML、关键标量、以及页面实际
+    请求过的 challenge/turnstile/api 资源（从 performance 记录看组件到底跑没跑）"""
     js = """
-    var all = document.querySelectorAll('body *');
-    var host = null;
-    for (var i = 0; i < all.length; i++) {
-        var t = all[i].innerText || '';
-        if (t.indexOf('確認しています') >= 0 && t.length < 300) { host = all[i]; }
-    }
-    var info = {found: !!host};
-    if (host) {
-        var h = host;
-        for (var j = 0; j < 4 && h.parentElement; j++) { h = h.parentElement; }
-        info.html = h.outerHTML.slice(0, 900);
-    }
-    var shadows = [];
-    for (var k = 0; k < all.length; k++) { if (all[k].shadowRoot) { shadows.push(all[k].tagName + '.' + String(all[k].className || '').slice(0, 40)); } }
-    info.shadow_hosts = shadows.slice(0, 10);
+    var info = {};
     info.ts_inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').length;
     info.render_type = typeof (window.turnstile && window.turnstile.render);
+    info.execute_type = typeof (window.turnstile && window.turnstile.execute);
+    var res = performance.getEntriesByType('resource').map(function(e){ return e.name; }).filter(function(n){ return n.indexOf('challenges') >= 0 || n.indexOf('turnstile') >= 0 || n.indexOf('/api/') >= 0; });
+    info.resources = res.slice(-15);
+    info.resources_total = res.length;
+    var all = document.querySelectorAll('body *');
+    var host = null, best = 1e9;
+    for (var i = 0; i < all.length; i++) {
+        var t = all[i].innerText || '';
+        if (t.indexOf('確認しています') >= 0 && t.length > 0 && t.length < best) { best = t.length; host = all[i]; }
+    }
+    info.found = !!host;
+    if (host) {
+        info.host_html = host.outerHTML.slice(0, 1200);
+        var chain = [], h = host;
+        for (var j = 0; j < 6 && h; j++) { chain.push(h.tagName + '.' + String(h.className || '').slice(0, 30)); h = h.parentElement; }
+        info.host_chain = chain;
+    }
+    var shadows = [];
+    for (var k = 0; k < all.length; k++) { if (all[k].shadowRoot) { shadows.push(all[k].tagName); } }
+    info.shadow_hosts = shadows.slice(0, 10);
     return JSON.stringify(info);
     """
     try:
