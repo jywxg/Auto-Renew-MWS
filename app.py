@@ -23,6 +23,10 @@ TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN") or ""    # TG 通知，可选
 # ------------- 代理配置 -------------
 IS_PROXY     = os.environ.get("IS_PROXY", "false").lower() == "true"   # 是否启用代理, 节点配置NODE_LINK节点自动开启
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+# socks5h 让代理远端解析域名：runner 本机解析可能拿到 IPv6，导致代理链挂起超时；
+# 实测 socks5(本地解析) 全灭、socks5h(远端解析) 全通 (2026-10-10)
+if PROXY_SERVER.startswith("socks5://"):
+    PROXY_SERVER = "socks5h://" + PROXY_SERVER[len("socks5://"):]
 
 # ------------- MWS 站点 / Discord OAuth 配置 -------------
 SITE_ORIGIN = "https://cloud.m-ws.cc"          # 控制台前端（续期 API 入口）
