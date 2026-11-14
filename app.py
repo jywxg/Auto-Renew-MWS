@@ -312,16 +312,27 @@ def _click_turnstile(page, rect):
     page.actions.move_to((cx, cy)).click()
     time.sleep(1)
 
-def _handle_turnstile(page):
-    """续期弹窗已打开后处理 Turnstile：先等自动通过；不行再点复选框并轮询 token，共 3 轮"""
+def _handle_turnstile(page, baseline_hours=None):
+    """验证面板已打开后处理 Turnstile：先等自动通过；不行再点复选框并轮询 token，共 3 轮。
+    本站面板渲染慢且可能是自动验证：等面板/等 token 期间若剩余时间已涨，说明已自动续上"""
     print("🤖 处理 Turnstile 验证...")
     if _get_turnstile_token(page):
         print("✅ Turnstile 已通过（有 token）")
         return True
-    # 先等小组件出现/自动通过，最多 15 秒
-    for _ in range(15):
+
+    def _renewed():
+        if baseline_hours is None:
+            return False
+        cur = _parse_remaining_hours(_page_text(page))
+        return cur is not None and cur > baseline_hours
+
+    # 先等小组件出现/自动通过，最多 25 秒（面板出现偏慢）
+    for _ in range(25):
         if _get_turnstile_token(page):
             print("✅ Turnstile 自动通过")
+            return True
+        if _renewed():
+            print("✅ 验证面板自动完成，续期已生效")
             return True
         if _find_turnstile_rect(page):
             break
@@ -329,6 +340,9 @@ def _handle_turnstile(page):
     if not _get_turnstile_token(page) and not _find_turnstile_rect(page):
         _turnstile_diag(page)
     for attempt in range(3):
+        if _renewed():
+            print("✅ 验证面板自动完成，续期已生效")
+            return True
         if attempt > 0 and _get_turnstile_token(page):
             # 上一轮点击可能已生效只是 token 来得慢：先确认，避免重复点击已验证的 widget
             print("✅ Turnstile 验证通过")
@@ -349,6 +363,9 @@ def _handle_turnstile(page):
         for _ in range(TURNSTILE_TOKEN_POLL_SECONDS):
             if _get_turnstile_token(page):
                 print("✅ Turnstile 验证通过")
+                return True
+            if _renewed():
+                print("✅ 验证完成，续期已生效")
                 return True
             time.sleep(1)
     return bool(_get_turnstile_token(page))
@@ -372,13 +389,18 @@ def _renew_candidates(page):
     return out
 
 def _dialog_appeared(page):
-    """点击后页面是否出现了弹窗/iframe/token（判断点击有没有生效）"""
+    """点击后验证面板是否出现：token/容器/弹窗元素，或正文出现验证面板文案。
+    本站的验证面板是无 role 的内嵌面板（文案「確認しています…」），且渲染偏慢，
+    既不在 iframe 里、也不是 role=dialog，只认文案才不会误判没打开"""
     if _get_turnstile_token(page) or _find_turnstile_rect(page):
         return True
     try:
-        return bool(page.run_js("return document.querySelectorAll('[role=\"dialog\"], dialog, iframe').length > 0;"))
+        if page.run_js("return document.querySelectorAll('[role=\"dialog\"], dialog, iframe').length > 0;"):
+            return True
     except Exception:
-        return False
+        pass
+    text = _page_text(page)
+    return any(k in text for k in ("確認しています", "確認中", "验证中", "驗證中", "Verify you are human", "正在验证"))
 
 def _open_renew_dialog(page):
     """逐个点击可见的续期按钮候选，每点一个就确认弹窗有没有真的打开；
@@ -503,7 +525,7 @@ def renew_server_browser(server_id: str):
                 _turnstile_diag(page)
                 print(f"❌ [{server_id}] 点了续期但验证弹窗没打开")
                 return False, None, ""
-            if not _handle_turnstile(page):
+            if not _handle_turnstile(page, baseline):
                 print(f"❌ [{server_id}] Turnstile 未通过")
                 continue
             ok, remaining = _wait_renew_outcome(page, baseline)
