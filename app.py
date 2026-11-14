@@ -326,8 +326,8 @@ def _handle_turnstile(page, baseline_hours=None):
         cur = _parse_remaining_hours(_page_text(page))
         return cur is not None and cur > baseline_hours
 
-    # 先等小组件出现/自动通过，最多 25 秒（面板出现偏慢）
-    for _ in range(25):
+    # 先等小组件出现/自动通过，最多 15 秒
+    for _ in range(15):
         if _get_turnstile_token(page):
             print("✅ Turnstile 自动通过")
             return True
@@ -339,9 +339,9 @@ def _handle_turnstile(page, baseline_hours=None):
         time.sleep(1)
     if not _get_turnstile_token(page) and not _find_turnstile_rect(page):
         _turnstile_diag(page)
-        # 纯等待：面板已在「確認しています…」状态时什么都不点，最多等 60 秒——
-        # 它可能只是慢（风险评分/网络往返），中途出 token/容器/续期生效就转入后续
-        for _ in range(30):
+        # 纯等待：面板已在「確認しています…」状态时先静等 10 秒再说——
+        # 两轮实测证明卡住时等再久状态也不变，60 秒纯属干耗，只留慢渲染的余量
+        for _ in range(5):
             if _get_turnstile_token(page) or _renewed():
                 print("✅ 等待期间验证自动完成")
                 return True
@@ -357,7 +357,7 @@ def _handle_turnstile(page, baseline_hours=None):
             print("✅ Turnstile 验证通过")
             return True
         rect = None
-        for _ in range(15):
+        for _ in range(8):
             rect = _find_turnstile_rect(page)
             if rect:
                 break
