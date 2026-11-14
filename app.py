@@ -127,7 +127,7 @@ def get_expiry_from_cookie(value: str):
         return None
 
 def renew_server(server_id: str):
-    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数)"""
+    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数, 错误代码)"""
     url = f"{SITE_ORIGIN}/api/bots/{server_id}/renew"
 
     try:
@@ -146,15 +146,259 @@ def renew_server(server_id: str):
                 remaining_hours = "未知"
 
             print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
-            return True, response.status_code, remaining_hours
+            return True, response.status_code, remaining_hours, ""
 
+        err_code = ""
+        try:
+            err_code = response.json().get("code", "") or ""
+        except Exception:
+            pass
         print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
-        return False, response.status_code, None
+        return False, response.status_code, None, err_code
 
     except Exception as e:
         print(f"❌ 服务器 [{server_id}] 请求发生异常, 请检查服务器是否被删除: {e}")
-        return False, None, None
+        return False, None, None, ""
 
+# ================= 浏览器续期（续期接口被 Turnstile 拦截时才用，登录方式不变） =================
+# 站点给续期接口加了 Cloudflare Turnstile：纯 HTTP 请求返回 403 captcha_required，
+# token 只能由真实浏览器现场生成。做法与 XServer 续期脚本一致：Chromium（Xvfb 有头）
+# 注入现有 COOKIE 打开 Bot 详情页，点续期按钮，在弹窗的 Turnstile 小组件里完成验证，
+# 由前端自己发出续期请求。COOKIE 的获取/刷新仍走后面的纯 HTTP 流程，本节不碰登录。
+
+TURNSTILE_TOKEN_POLL_SECONDS = int(os.environ.get("TURNSTILE_TOKEN_POLL_SECONDS", "30"))
+
+def _browser_proxy():
+    """Chromium 用的代理地址，与 build_proxies 同源；Chromium 的 socks5 自带远端解析，不用 socks5h 写法"""
+    if not IS_PROXY:
+        return ""
+    if PROXY_SERVER.startswith("socks5h://"):
+        return "socks5://" + PROXY_SERVER[len("socks5h://"):]
+    return PROXY_SERVER
+
+def _build_browser_options():
+    from DrissionPage import ChromiumOptions
+    co = ChromiumOptions()
+    browser_path = os.getenv("BROWSER_PATH", "/usr/bin/google-chrome")
+    if os.path.exists(browser_path):
+        co.set_browser_path(browser_path)
+    co.set_user_data_path(os.path.abspath("./chrome-profile-mws"))
+    proxy = _browser_proxy()
+    if proxy:
+        co.set_proxy(proxy)
+        print(f"🌐 Chrome 代理: {proxy}")
+    # GitHub Actions + Xvfb 下运行有头 Chrome（与 XServer 脚本同一套参数）
+    co.set_argument("--window-size=1920,1080")
+    co.set_argument("--disable-dev-shm-usage")
+    co.set_argument("--no-sandbox")
+    co.set_argument("--disable-gpu")
+    co.set_argument("--lang=ja-JP,ja,zh-CN,zh,en-US,en")
+    co.set_argument("--disable-blink-features=AutomationControlled")
+    co.set_argument("--disable-infobars")
+    co.set_argument("--no-first-run")
+    co.set_argument("--no-default-browser-check")
+    co.set_argument("--disable-sync")
+    return co
+
+def _page_text(page):
+    try:
+        return page.run_js("return document.body ? document.body.innerText : '';") or ""
+    except Exception:
+        return ""
+
+def _parse_remaining_hours(text):
+    """从详情页文本解析剩余小时数：'剩余 6天 23h' / 'SLEEP IN 167h' / '剩余 167h'"""
+    if not text:
+        return None
+    m = re.search(r"(\d+)\s*天\s*(\d+)\s*h", text)
+    if m:
+        return int(m.group(1)) * 24 + int(m.group(2))
+    m = re.search(r"SLEEP IN\s*(\d+)\s*h", text, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"剩余\s*(\d+)\s*h", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+def _find_turnstile_rect(page):
+    """找到 Turnstile 可点击区域，返回视口坐标 [x, y, w, h]；找不到返回 None。
+    优先 iframe（checkbox 实际所在），其次 .cf-turnstile 容器，最后带 data-sitekey 的元素。
+    （与 XServer 脚本同一套定位链）"""
+    js = """
+    var el = document.querySelector('.cf-turnstile iframe[src*="challenges.cloudflare.com"]');
+    if (!el || el.getClientRects().length === 0) el = document.querySelector('.cf-turnstile iframe');
+    if (!el || el.getClientRects().length === 0) el = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    if (!el || el.getClientRects().length === 0) el = document.querySelector('.cf-turnstile');
+    if (!el || el.getClientRects().length === 0) el = document.querySelector('.turnstile-wrapper');
+    if (!el || el.getClientRects().length === 0) el = document.querySelector('[data-sitekey]');
+    if (!el) return null;
+    var r = el.getBoundingClientRect();
+    if (!r || r.width === 0 || r.height === 0) return null;
+    return [r.left, r.top, r.width, r.height];
+    """
+    try:
+        rect = page.run_js(js)
+        if rect and len(rect) == 4:
+            return [float(v) for v in rect]
+    except Exception:
+        pass
+    return None
+
+def _get_turnstile_token(page):
+    """读取 cf-turnstile-response 隐藏域 token（存在且足够长才算通过）"""
+    try:
+        token = page.run_js(
+            "var i=document.querySelector('input[name=\"cf-turnstile-response\"]');"
+            "return (i&&i.value)||'';"
+        )
+        return token if isinstance(token, str) and len(token) > 20 else ""
+    except Exception:
+        return ""
+
+def _click_turnstile(page, rect):
+    """点击 Turnstile checkbox：取 iframe/容器中心点，而非固定偏移"""
+    x, y, w, h = rect
+    cx = x + max(20, w / 2)
+    cy = y + max(20, h / 2)
+    print(f"🎯 点击 Turnstile ({int(cx)},{int(cy)})...")
+    page.actions.move_to((cx, cy)).click()
+    time.sleep(1)
+
+def _handle_turnstile(page):
+    """续期弹窗已打开后处理 Turnstile：先等自动通过；不行再点复选框并轮询 token，共 3 轮"""
+    print("🤖 处理 Turnstile 验证...")
+    if _get_turnstile_token(page):
+        print("✅ Turnstile 已通过（有 token）")
+        return True
+    # 先等小组件出现/自动通过，最多 15 秒
+    for _ in range(15):
+        if _get_turnstile_token(page):
+            print("✅ Turnstile 自动通过")
+            return True
+        if _find_turnstile_rect(page):
+            break
+        time.sleep(1)
+    for attempt in range(3):
+        if attempt > 0 and _get_turnstile_token(page):
+            # 上一轮点击可能已生效只是 token 来得慢：先确认，避免重复点击已验证的 widget
+            print("✅ Turnstile 验证通过")
+            return True
+        rect = None
+        for _ in range(15):
+            rect = _find_turnstile_rect(page)
+            if rect:
+                break
+            time.sleep(1)
+        if not rect:
+            print(f"⚠️ 第 {attempt+1} 次没找到 Turnstile 容器")
+            continue
+        time.sleep(1)  # 容器出现后再稳 1 秒，等 widget 可交互
+        rect = _find_turnstile_rect(page) or rect
+        _click_turnstile(page, rect)
+        # 轮询等 token：点后启动的可能是慢挑战，统一等满一轮，不中途打断
+        for _ in range(TURNSTILE_TOKEN_POLL_SECONDS):
+            if _get_turnstile_token(page):
+                print("✅ Turnstile 验证通过")
+                return True
+            time.sleep(1)
+    return bool(_get_turnstile_token(page))
+
+def _click_renew_button(page):
+    """在详情页点击续期按钮（重置计时器/续期/延長），点到返回 True"""
+    js = r"""
+    var btns = document.querySelectorAll('button, a');
+    for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].innerText || '').trim();
+        if (/重置计时器|续期|延長/.test(t) && btns[i].offsetParent !== null) {
+            btns[i].scrollIntoView();
+            btns[i].click();
+            return t;
+        }
+    }
+    return '';
+    """
+    try:
+        return bool(page.run_js(js))
+    except Exception:
+        return False
+
+def _wait_renew_outcome(page, baseline_hours, timeout=30):
+    """等前端发出续期请求后的结果：剩余时间变多（或满 168h）判成功；失败提示判失败。
+    返回 (是否成功, 最新读到的剩余小时数)"""
+    deadline = time.time() + timeout
+    last = baseline_hours
+    while time.time() < deadline:
+        text = _page_text(page)
+        if any(k in text for k in ("確認に失敗しました", "验证失败", "驗證失敗")):
+            return False, last
+        cur = _parse_remaining_hours(text)
+        if cur is not None:
+            last = cur
+            if baseline_hours is not None and cur > baseline_hours:
+                return True, cur
+            if cur >= 168 and not _find_turnstile_rect(page):
+                return True, cur
+        time.sleep(2)
+    return False, last
+
+def renew_server_browser(server_id: str):
+    """浏览器续期单个服务器，返回 (是否成功, 剩余小时数, 失败原因)；
+    原因 'auth' 表示 COOKIE 在浏览器里未登录，'' 为一般失败，'captcha' 为验证未过"""
+    try:
+        from DrissionPage import ChromiumPage
+    except Exception:
+        print("❌ 未安装 DrissionPage，无法走浏览器续期")
+        return False, None, ""
+    page = None
+    try:
+        page = ChromiumPage(_build_browser_options())
+        page.get(f"{SITE_ORIGIN}/")
+        time.sleep(2)
+        page.set.cookies({
+            "name": COOKIE_NAME, "value": COOKIE,
+            "domain": "cloud.m-ws.cc", "path": "/", "secure": True,
+        })
+        page.get(f"{SITE_ORIGIN}/bots/{server_id}")
+        time.sleep(3)
+        text = _page_text(page)
+        baseline = _parse_remaining_hours(text)
+        if "/login" in page.url or baseline is None and "ログイン" in text:
+            print(f"❌ [{server_id}] 浏览器里未登录（COOKIE 可能已失效）")
+            return False, None, "auth"
+        if baseline is not None:
+            print(f"🖥 [{server_id}] 浏览器续期：当前剩余 {baseline} 小时")
+        # 预刷新一次再验证（XServer 现行策略：先刷新一遍，坏抽签概率低）
+        page.refresh()
+        time.sleep(3)
+        baseline = _parse_remaining_hours(_page_text(page)) or baseline
+        for round_no in range(2):
+            if round_no == 1:
+                print("🔄 第一轮未成功，刷新页面再试一轮...")
+                page.refresh()
+                time.sleep(3)
+            if not _click_renew_button(page):
+                print(f"❌ [{server_id}] 没找到续期按钮")
+                return False, None, ""
+            time.sleep(2)  # 等验证弹窗
+            if not _handle_turnstile(page):
+                print(f"❌ [{server_id}] Turnstile 未通过")
+                continue
+            ok, remaining = _wait_renew_outcome(page, baseline)
+            if ok:
+                print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining} 小时")
+                return True, remaining, ""
+            print(f"⚠️ [{server_id}] 验证通过但续期未生效")
+        return False, None, "captcha"
+    except Exception as e:
+        print(f"❌ [{server_id}] 浏览器续期异常: {e}")
+        return False, None, ""
+    finally:
+        if page is not None:
+            try:
+                page.quit()
+            except Exception:
+                pass
 # ================= Discord OAuth 登录（API 请求失败时的兜底，纯 HTTP） =================
 #   1) GET /auth/login 拿授权 URL（含 state），Session 自动种下 oauth_state cookie
 #   2) DISCORD_TOKEN 调 Discord OAuth2 API 授权，拿回带 code 的回调 location
@@ -360,49 +604,92 @@ def main():
     # ---------- 第一轮：使用现有 COOKIE 调续期 API ----------
     results = {}      
     all_ok = True
+    captcha_pending = []   # 被 Turnstile 拦下的服务器，转第三轮浏览器续期
+    auth_failed = False    # 出现过认证失败（COOKIE 可能已失效）
     for s_id in server_list:
-        ok, status_code, remaining = renew_server(s_id)
+        ok, status_code, remaining, err_code = renew_server(s_id)
         results[s_id] = remaining if ok else None
         if not ok:
-            all_ok = False
-            if status_code in (401, 403):
+            if err_code == "captcha_required":
+                print(f"🔐 [{s_id}] 续期被 Turnstile 拦截，转浏览器续期")
+                captcha_pending.append(s_id)
+            elif status_code in (401, 403):
+                auth_failed = True
                 print(f"⚠️ [{s_id}] 认证失败（HTTP {status_code}），COOKIE 可能已失效")
         time.sleep(2)
+
+    all_ok = all(v is not None for v in results.values())
 
     new_cookie = ""
 
     if all_ok:
         print("🏁 全部服务器续期成功，续期任务完成")
     else:
-        # ---------- COOKIE失效走第二轮：浏览器登录 Discord 获取新 COOKIE ----------
-        if not DISCORD_TOKEN:
-            print("❌ 存在续期失败的服务器，但未配置 DISCORD_TOKEN，无法自动获取新的Cookie")
-            send_tg_notification(
-                "🇯🇵 MWS 续期通知\n\n"
-                f"❌ 续期失败\n👤 账户: {EMAIL}\n"
-                "⚠️ COOKIE 可能已失效，且未配置 DISCORD_TOKEN，无法自动刷新。"
-            )
-            return
+        # ---------- 第二轮：只有认证失败才换 COOKIE（Discord OAuth，纯 HTTP，与原来一致） ----------
+        # 被 Turnstile 拦下的不属于 COOKIE 失效，不在这里处理，走后面的浏览器续期
+        need_http_retry = auth_failed and any(
+            results[s] is None and s not in captcha_pending for s in server_list
+        )
+        if need_http_retry:
+            if not DISCORD_TOKEN:
+                print("❌ 存在续期失败的服务器，但未配置 DISCORD_TOKEN，无法自动获取新的Cookie")
+                send_tg_notification(
+                    "🇯🇵 MWS 续期通知\n\n"
+                    f"❌ 续期失败\n👤 账户: {EMAIL}\n"
+                    "⚠️ COOKIE 可能已失效，且未配置 DISCORD_TOKEN，无法自动刷新。"
+                )
+                return
 
-        # 纯 HTTP OAuth（curl_cffi chrome TLS 指纹，无需浏览器）
-        new_cookie = fetch_new_cookie_via_http()
-        if not new_cookie:
-            send_tg_notification(
-                "🇯🇵 MWS 续期通知\n\n"
-                f"❌ 续期失败\n👤 账户: {EMAIL}\n"
-                "⚠️ COOKIE 失效且 Discord OAuth 登录失败，请检查 DISCORD_TOKEN 或代理节点。"
-            )
-            return
+            # 纯 HTTP OAuth（curl_cffi chrome TLS 指纹，无需浏览器）
+            new_cookie = fetch_new_cookie_via_http()
+            if not new_cookie:
+                send_tg_notification(
+                    "🇯🇵 MWS 续期通知\n\n"
+                    f"❌ 续期失败\n👤 账户: {EMAIL}\n"
+                    "⚠️ COOKIE 失效且 Discord OAuth 登录失败，请检查 DISCORD_TOKEN 或代理节点。"
+                )
+                return
 
-        COOKIE = new_cookie
+            COOKIE = new_cookie
 
-        # ---------- 用新 COOKIE 重新请求续期 API ----------
-        print("\n🔁 使用新 COOKIE 重新请求续期 API ...")
-        for s_id in server_list:
-            print(f"🔁 续期服务器 [{s_id}] ...")
-            ok2, _, remaining2 = renew_server(s_id)
-            results[s_id] = remaining2 if ok2 else None
-            time.sleep(2)
+            # ---------- 用新 COOKIE 重新请求续期 API ----------
+            print("\n🔁 使用新 COOKIE 重新请求续期 API ...")
+            for s_id in server_list:
+                if results[s_id] is not None or s_id in captcha_pending:
+                    continue
+                print(f"🔁 续期服务器 [{s_id}] ...")
+                ok2, _, remaining2, err_code2 = renew_server(s_id)
+                if ok2:
+                    results[s_id] = remaining2
+                elif err_code2 == "captcha_required":
+                    captcha_pending.append(s_id)
+                time.sleep(2)
+
+        # ---------- 第三轮：浏览器续期（过 Turnstile，登录方式不变） ----------
+        if captcha_pending:
+            print(f"\n🌐 以下服务器走浏览器续期: {list(captcha_pending)}")
+            browser_auth_failed = []
+            for s_id in list(captcha_pending):
+                ok_b, remaining_b, reason_b = renew_server_browser(s_id)
+                if ok_b:
+                    results[s_id] = remaining_b
+                    captcha_pending.remove(s_id)
+                elif reason_b == "auth":
+                    browser_auth_failed.append(s_id)
+                time.sleep(2)
+
+            # 浏览器里未登录、且本轮还没换过 COOKIE：换一次 COOKIE 再试浏览器续期
+            if browser_auth_failed and not new_cookie and DISCORD_TOKEN:
+                new_cookie = fetch_new_cookie_via_http()
+                if new_cookie:
+                    COOKIE = new_cookie
+                    for s_id in browser_auth_failed:
+                        ok_b, remaining_b, _ = renew_server_browser(s_id)
+                        if ok_b:
+                            results[s_id] = remaining_b
+                            if s_id in captcha_pending:
+                                captcha_pending.remove(s_id)
+                        time.sleep(2)
 
         all_ok = all(v is not None for v in results.values())
 
