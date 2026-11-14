@@ -186,10 +186,10 @@ def _build_browser_options():
     if os.path.exists(browser_path):
         co.set_browser_path(browser_path)
     co.set_user_data_path(os.path.abspath("./chrome-profile-mws"))
-    proxy = _browser_proxy()
-    if proxy:
-        co.set_proxy(proxy)
-        print(f"🌐 Chrome 代理: {proxy}")
+    # 浏览器一律直连：多次实测直连打开站点正常；走 sing-box 的 http 入口时
+    # Chrome 报 ERR_CONNECTION_RESET，DrissionPage 本身也不支持 socks 代理。
+    # 接口(HTTP)侧的代理逻辑不受影响，照旧走 socks5h。
+    print("🌐 Chrome 直连（不使用代理）")
     # GitHub Actions + Xvfb 下运行有头 Chrome（与 XServer 脚本同一套参数）
     co.set_argument("--window-size=1920,1080")
     co.set_argument("--disable-dev-shm-usage")
