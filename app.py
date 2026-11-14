@@ -186,10 +186,24 @@ def _build_browser_options():
     if os.path.exists(browser_path):
         co.set_browser_path(browser_path)
     co.set_user_data_path(os.path.abspath("./chrome-profile-mws"))
-    # 浏览器一律直连：多次实测直连打开站点正常；走 sing-box 的 http 入口时
-    # Chrome 报 ERR_CONNECTION_RESET，DrissionPage 本身也不支持 socks 代理。
-    # 接口(HTTP)侧的代理逻辑不受影响，照旧走 socks5h。
-    print("🌐 Chrome 直连（不使用代理）")
+    # 浏览器代理：DrissionPage 的 set_proxy 不支持 socks，改用 Chrome 原生命令行参数
+    # --proxy-server=socks5://（Chrome 的 socks5 自带远程解析，等价 socks5h）。
+    # 直连实测：验证组件能渲染、挑战页也加载了，但内部一直超时打转（auto_timeout）——
+    # 机房出口 IP 的风控评分过不去是最可能的变量；走代理时 Cloudflare 看到的是节点
+    # 出口 IP。无代理时直连。接口(HTTP)侧的 socks5h 逻辑不受影响。
+    if IS_PROXY and PROXY_SERVER:
+        chrome_proxy = PROXY_SERVER
+        for pre in ("socks5h://", "socks5://"):
+            if chrome_proxy.startswith(pre):
+                chrome_proxy = "socks5://" + chrome_proxy[len(pre):]
+                break
+        if chrome_proxy.startswith("socks5://"):
+            co.set_argument(f"--proxy-server={chrome_proxy}")
+            print(f"🌐 Chrome 代理（原生参数）: {chrome_proxy}")
+        else:
+            print("🌐 Chrome 直连（代理非 socks，不适用原生参数）")
+    else:
+        print("🌐 Chrome 直连（不使用代理）")
     # GitHub Actions + Xvfb 下运行有头 Chrome（与 XServer 脚本同一套参数）
     co.set_argument("--window-size=1920,1080")
     co.set_argument("--disable-dev-shm-usage")
