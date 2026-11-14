@@ -339,6 +339,15 @@ def _handle_turnstile(page, baseline_hours=None):
         time.sleep(1)
     if not _get_turnstile_token(page) and not _find_turnstile_rect(page):
         _turnstile_diag(page)
+        # 纯等待：面板已在「確認しています…」状态时什么都不点，最多等 60 秒——
+        # 它可能只是慢（风险评分/网络往返），中途出 token/容器/续期生效就转入后续
+        for _ in range(30):
+            if _get_turnstile_token(page) or _renewed():
+                print("✅ 等待期间验证自动完成")
+                return True
+            if _find_turnstile_rect(page):
+                break
+            time.sleep(2)
     for attempt in range(3):
         if _renewed():
             print("✅ 验证面板自动完成，续期已生效")
@@ -368,7 +377,10 @@ def _handle_turnstile(page, baseline_hours=None):
                 print("✅ 验证完成，续期已生效")
                 return True
             time.sleep(1)
-    return bool(_get_turnstile_token(page))
+    ok = bool(_get_turnstile_token(page))
+    if not ok and not _renewed():
+        _panel_dump(page)
+    return ok or _renewed()
 
 RENEW_TEXT_RE = re.compile(r"重置计时器|续期|延長|リセット|Reset timer|Extend|Renew", re.I)
 
@@ -458,6 +470,34 @@ def _turnstile_diag(page):
         print(f"🔎 Turnstile 现场: {page.run_js(js)}")
     except Exception as e:
         print(f"🔎 Turnstile 现场读取失败: {e}")
+
+def _panel_dump(page):
+    """把「確認しています…」面板的 DOM 结构打进日志：它挂在哪、里面有什么、
+    有没有 shadow DOM 宿主、turnstile.render 是否可用——定位组件到底渲染没渲染"""
+    js = """
+    var all = document.querySelectorAll('body *');
+    var host = null;
+    for (var i = 0; i < all.length; i++) {
+        var t = all[i].innerText || '';
+        if (t.indexOf('確認しています') >= 0 && t.length < 300) { host = all[i]; }
+    }
+    var info = {found: !!host};
+    if (host) {
+        var h = host;
+        for (var j = 0; j < 4 && h.parentElement; j++) { h = h.parentElement; }
+        info.html = h.outerHTML.slice(0, 900);
+    }
+    var shadows = [];
+    for (var k = 0; k < all.length; k++) { if (all[k].shadowRoot) { shadows.push(all[k].tagName + '.' + String(all[k].className || '').slice(0, 40)); } }
+    info.shadow_hosts = shadows.slice(0, 10);
+    info.ts_inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').length;
+    info.render_type = typeof (window.turnstile && window.turnstile.render);
+    return JSON.stringify(info);
+    """
+    try:
+        print(f"🔎 面板结构: {page.run_js(js)}")
+    except Exception as e:
+        print(f"🔎 面板结构读取失败: {e}")
 
 def _wait_renew_outcome(page, baseline_hours, timeout=30):
     """等前端发出续期请求后的结果：剩余时间变多（或满 168h）判成功；失败提示判失败。
