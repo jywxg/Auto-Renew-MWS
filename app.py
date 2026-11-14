@@ -326,6 +326,8 @@ def _handle_turnstile(page):
         if _find_turnstile_rect(page):
             break
         time.sleep(1)
+    if not _get_turnstile_token(page) and not _find_turnstile_rect(page):
+        _turnstile_diag(page)
     for attempt in range(3):
         if attempt > 0 and _get_turnstile_token(page):
             # 上一轮点击可能已生效只是 token 来得慢：先确认，避免重复点击已验证的 widget
@@ -352,7 +354,21 @@ def _handle_turnstile(page):
     return bool(_get_turnstile_token(page))
 
 def _click_renew_button(page):
-    """在详情页点击续期按钮（重置计时器/续期/延長），点到返回 True"""
+    """在详情页点击续期按钮：优先 DrissionPage 真实点击（JS .click() 可能触发不了
+    某些前端的指针事件链、弹窗打不开），找不到元素再退回 JS click"""
+    pattern = re.compile(r"重置计时器|续期|延長|リセット|Reset timer|Extend|Renew", re.I)
+    try:
+        for tag in ("button", "a"):
+            for ele in page.eles(f"tag:{tag}"):
+                try:
+                    t = (ele.text or "").strip()
+                except Exception:
+                    continue
+                if t and pattern.search(t):
+                    ele.click()
+                    return True
+    except Exception:
+        pass
     js = r"""
     var btns = document.querySelectorAll('button, a');
     for (var i = 0; i < btns.length; i++) {
@@ -369,6 +385,19 @@ def _click_renew_button(page):
         return bool(page.run_js(js))
     except Exception:
         return False
+
+def _turnstile_diag(page):
+    """Turnstile 容器找不到时，把现场打进日志：页面里所有 iframe、弹窗、turnstile API 是否加载"""
+    js = """
+    var iframes = Array.prototype.map.call(document.querySelectorAll('iframe'), function(f){ return (f.src || '').slice(0, 90); });
+    var dialogs = document.querySelectorAll('[role="dialog"], dialog');
+    var dtext = dialogs.length ? (dialogs[0].innerText || '').replace(/\\n/g, ' ').slice(0, 120) : '';
+    return JSON.stringify({iframes: iframes, dialogs: dialogs.length, dialog_text: dtext, turnstile_api: typeof window.turnstile !== 'undefined'});
+    """
+    try:
+        print(f"🔎 Turnstile 现场: {page.run_js(js)}")
+    except Exception as e:
+        print(f"🔎 Turnstile 现场读取失败: {e}")
 
 def _wait_renew_outcome(page, baseline_hours, timeout=30):
     """等前端发出续期请求后的结果：剩余时间变多（或满 168h）判成功；失败提示判失败。
