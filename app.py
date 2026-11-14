@@ -353,46 +353,84 @@ def _handle_turnstile(page):
             time.sleep(1)
     return bool(_get_turnstile_token(page))
 
-def _click_renew_button(page):
-    """在详情页点击续期按钮：优先 DrissionPage 真实点击（JS .click() 可能触发不了
-    某些前端的指针事件链、弹窗打不开），找不到元素再退回 JS click"""
-    pattern = re.compile(r"重置计时器|续期|延長|リセット|Reset timer|Extend|Renew", re.I)
+RENEW_TEXT_RE = re.compile(r"重置计时器|续期|延長|リセット|Reset timer|Extend|Renew", re.I)
+
+def _renew_candidates(page):
+    """详情页里所有可见的续期按钮元素（页面可能有隐藏的响应式副本，点隐藏的等于没点）"""
+    out = []
     try:
         for tag in ("button", "a"):
             for ele in page.eles(f"tag:{tag}"):
                 try:
                     t = (ele.text or "").strip()
+                    if t and RENEW_TEXT_RE.search(t) and ele.states.is_displayed:
+                        out.append((ele, t))
                 except Exception:
                     continue
-                if t and pattern.search(t):
-                    ele.click()
-                    return True
     except Exception:
         pass
+    return out
+
+def _dialog_appeared(page):
+    """点击后页面是否出现了弹窗/iframe/token（判断点击有没有生效）"""
+    if _get_turnstile_token(page) or _find_turnstile_rect(page):
+        return True
+    try:
+        return bool(page.run_js("return document.querySelectorAll('[role=\"dialog\"], dialog, iframe').length > 0;"))
+    except Exception:
+        return False
+
+def _open_renew_dialog(page):
+    """逐个点击可见的续期按钮候选，每点一个就确认弹窗有没有真的打开；
+    都不行再用 JS 派发 pointer/mouse/click 全套事件兜底"""
+    cands = _renew_candidates(page)
+    print(f"🖱 可见续期按钮候选: {len(cands)} 个")
+    for ele, t in cands:
+        print(f"🖱 点击续期按钮: {t[:50]}")
+        try:
+            ele.click()
+        except Exception:
+            continue
+        for _ in range(8):
+            if _dialog_appeared(page):
+                return True
+            time.sleep(0.5)
     js = r"""
     var btns = document.querySelectorAll('button, a');
     for (var i = 0; i < btns.length; i++) {
         var t = (btns[i].innerText || '').trim();
         if (/重置计时器|续期|延長|リセット|Reset timer|Extend|Renew/i.test(t) && btns[i].offsetParent !== null) {
-            btns[i].scrollIntoView();
-            btns[i].click();
+            var r = btns[i].getBoundingClientRect();
+            var opts = {bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, view: window};
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(type) {
+                var Ev = (type.indexOf('pointer') === 0 && window.PointerEvent) ? PointerEvent : MouseEvent;
+                btns[i].dispatchEvent(new Ev(type, opts));
+            });
             return t;
         }
     }
     return '';
     """
     try:
-        return bool(page.run_js(js))
+        hit = page.run_js(js)
+        if hit:
+            print(f"🖱 JS 全事件序列点击: {str(hit)[:50]}")
     except Exception:
-        return False
+        pass
+    for _ in range(8):
+        if _dialog_appeared(page):
+            return True
+        time.sleep(0.5)
+    return False
 
 def _turnstile_diag(page):
-    """Turnstile 容器找不到时，把现场打进日志：页面里所有 iframe、弹窗、turnstile API 是否加载"""
+    """Turnstile 容器找不到时，把现场打进日志：页面里所有 iframe、弹窗、turnstile API 是否加载、正文尾部"""
     js = """
     var iframes = Array.prototype.map.call(document.querySelectorAll('iframe'), function(f){ return (f.src || '').slice(0, 90); });
     var dialogs = document.querySelectorAll('[role="dialog"], dialog');
     var dtext = dialogs.length ? (dialogs[0].innerText || '').replace(/\\n/g, ' ').slice(0, 120) : '';
-    return JSON.stringify({iframes: iframes, dialogs: dialogs.length, dialog_text: dtext, turnstile_api: typeof window.turnstile !== 'undefined'});
+    var tail = (document.body.innerText || '').replace(/\\n/g, ' ').slice(-160);
+    return JSON.stringify({iframes: iframes, dialogs: dialogs.length, dialog_text: dtext, turnstile_api: typeof window.turnstile !== 'undefined', body_tail: tail});
     """
     try:
         print(f"🔎 Turnstile 现场: {page.run_js(js)}")
@@ -460,11 +498,11 @@ def renew_server_browser(server_id: str):
                 print("🔄 第一轮未成功，刷新页面再试一轮...")
                 page.refresh()
                 _wait_detail_ready(page, timeout=15)
-            if not _click_renew_button(page):
+            if not _open_renew_dialog(page):
                 _log_page_diag(page, server_id)
-                print(f"❌ [{server_id}] 没找到续期按钮")
+                _turnstile_diag(page)
+                print(f"❌ [{server_id}] 点了续期但验证弹窗没打开")
                 return False, None, ""
-            time.sleep(2)  # 等验证弹窗
             if not _handle_turnstile(page):
                 print(f"❌ [{server_id}] Turnstile 未通过")
                 continue
